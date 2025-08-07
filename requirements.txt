@@ -1,6 +1,33 @@
-streamlit
-openai
-regex
-faster-whisper
-pysubs2
-ffmpeg-python
+# 视频字幕生成工具依赖包
+
+# Web界面
+gradio>=4.0.0
+
+# 核心依赖
+numpy>=1.21.0
+librosa>=0.9.0
+pydub>=0.25.0
+moviepy>=1.0.3
+
+# 语音识别模型
+faster-whisper>=0.9.0
+torch>=1.9.0
+torchaudio>=0.9.0
+
+# 音频处理
+ffmpeg-python>=0.2.0
+audio-separator==0.16.5
+
+# 翻译服务
+openai>=1.0.0
+requests>=2.25.0
+tencentcloud-sdk-python>=3.0.0
+
+# 其他工具
+chardet==3.0.4
+
+# 注意事项：
+# 1. 需要安装FFmpeg并添加到系统PATH
+# 2. 需要下载语音识别模型文件到./models/目录
+# 3. Windows用户可能需要安装Microsoft Visual C++ 14.0
+# 4. 已移除webrtcvad依赖，使用基于librosa的VAD实现
