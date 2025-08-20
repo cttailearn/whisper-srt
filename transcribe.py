@@ -31,6 +31,7 @@ class Transcribe:
         torch.cuda.empty_cache()
 
     def run(self,file_name,audio_binary_io = None,language='ja',
+            task="transcribe",
             beam_size = 5,
             is_vad_filter=False,
             min_silence_duration_ms=500,
@@ -76,16 +77,50 @@ class Transcribe:
         else:
             vad_parameters = dict(min_silence_duration_ms=min_silence_duration_ms)
         
-        segments, info = self.model.transcribe(audio = audio,
-                                        beam_size=beam_size,
-                                        language=language,
-                                        vad_filter=is_vad_filter,
-                                        vad_parameters=vad_parameters,
-                                        initial_prompt = initial_prompt,
-                                        word_timestamps=True,
-                                        #condition_on_previous_text=False,
-                                        #no_speech_threshold=0.6,
-                                        )
+        try:
+            print(f"[INFO] 开始转录音频，模型: {self.model}")
+            segments, info = self.model.transcribe(audio = audio,
+                                            task=task,
+                                            beam_size=beam_size,
+                                            language=language,
+                                            vad_filter=is_vad_filter,
+                                            vad_parameters=vad_parameters,
+                                            initial_prompt = initial_prompt,
+                                            word_timestamps=True,
+                                            #condition_on_previous_text=False,
+                                            #no_speech_threshold=0.6,
+                                            )
+            print(f"[INFO] 转录完成，音频时长: {info.duration:.2f}秒")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"[ERROR] 字幕生成失败: {error_msg}")
+            
+            # 针对特定错误提供解决方案
+            if "Invalid input features shape" in error_msg:
+                print(f"[ERROR] 模型输入特征形状不匹配错误")
+                print(f"[ERROR] 错误详情: {error_msg}")
+                print(f"[SOLUTION] 可能的解决方案:")
+                print(f"[SOLUTION] 1. 模型版本不兼容，请尝试使用标准模型名称如 'large-v3'")
+                print(f"[SOLUTION] 2. 如果使用自定义模型，请确保模型是正确的CTranslate2格式")
+                print(f"[SOLUTION] 3. 尝试重新转换模型: ct2-transformers-converter --model [原模型路径] --output_dir [输出路径]")
+                print(f"[SOLUTION] 4. 检查faster-whisper和ctranslate2版本兼容性")
+                print(f"[SOLUTION] 5. 尝试使用CPU设备而非GPU")
+            elif "CUDA" in error_msg or "cuda" in error_msg:
+                print(f"[ERROR] CUDA相关错误: {error_msg}")
+                print(f"[SOLUTION] 1. 检查CUDA和cuDNN版本兼容性")
+                print(f"[SOLUTION] 2. 尝试使用CPU设备")
+                print(f"[SOLUTION] 3. 检查GPU内存是否足够")
+            elif "Unable to open file" in error_msg or "model.bin" in error_msg:
+                print(f"[ERROR] 模型文件错误: {error_msg}")
+                print(f"[SOLUTION] 1. 检查模型文件是否完整")
+                print(f"[SOLUTION] 2. 确保模型是CTranslate2格式")
+                print(f"[SOLUTION] 3. 重新下载或转换模型")
+            else:
+                print(f"[ERROR] 未知错误: {error_msg}")
+                print(f"[SOLUTION] 请检查音频文件格式和模型配置")
+            
+            # 重新抛出异常，让上层处理
+            raise Exception(f"字幕生成失败: {error_msg}")
 
         results= []
         with tqdm(total=round(info.duration, 2), unit=" seconds") as pbar:
@@ -109,7 +144,8 @@ class Transcribe:
 
 
 if __name__ == "__main__":
-    test = Transcribe(model_name = r"D:\code\auto-subtitle\models\faster-whisper-large-v3",device="cuda")
+    # 使用标准模型名称而不是本地路径
+    test = Transcribe(model_name="large-v3", device="cuda")
     # 测试直接传入文件地址
     #test.run(file_name="./test.mp3")
 
@@ -122,8 +158,4 @@ if __name__ == "__main__":
                  #is_vad_filter=True,
                  #is_split=False
         )
-
-
-
-
 
