@@ -19,17 +19,15 @@
 
 * conda
     ```bash
-    conda create -n subtitle python=3.10
-    conda activate subtitle
+    conda create -n srt python=3.12
+    conda activate srt
     ```
 
-* torch（CUDA 11.8，其他版本去[官网](https://pytorch.org/get-started/locally/)找）
+* torch
     ```bash
     # GPU
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
-    # CPU
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
     ```
 
 * 安装ffmpeg（windows）。
@@ -71,7 +69,12 @@
 * **模型来源**：
   - [HuggingFace faster-whisper](https://huggingface.co/collections/guillaumekln/faster-whisper-64f9c349b3115b4f51434976)
   - [百度云备份](https://pan.baidu.com/s/1NbutR2cHvHbboUy-QTg5zw?pwd=kuon)
-
+* **自定义模型转换**：
+```
+pip install faster-whisper
+pip install transformers[torch]>=4.23
+ct2-transformers-converter --model 本地模型目录或者huggingface --output_dir 输出目录 --copy_files tokenizer.json preprocessor_config.json --quantization float16
+```
 ### 音频清洁模型（UVR）
 
 * **必需文件**：`UVR_MDXNET_Main.onnx`
