@@ -2,6 +2,7 @@ import gradio as gr
 import json
 import os
 import traceback
+from datetime import datetime
 from transcribe import Transcribe
 from zipfile import ZipFile
 import base64
@@ -10,6 +11,7 @@ import ffmpeg
 from translation import GPT, Baidu, Tencent, translation
 from utils import extract_audio, merge_subtitles_to_video, clear_folder, import_config_file
 from uvr import UVR_Client
+import torch
 
 # 临时文件存放地址
 TEMP = "./temp"
@@ -18,7 +20,6 @@ TEMP = "./temp"
 class AppState:
     def __init__(self):
         self.transcribe = None
-        self.config = None
         self.audio_temp = None
         self.video_temp = None
         self.video_temp_name = None
@@ -26,10 +27,14 @@ class AppState:
         self.uvr_client = None
         self.engine = None
         
-        # 默认配置
+        # 模型配置
         self.model_list = ["tiny", "base", "small", "medium", "large-v2", "large-v3",
                           "tiny.en", "base.en", "medium.en", "small.en"]
-        self.model_name = "large-v2"
+        self.model_name = "large-v3"# 设备配置
+        self.device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        self.compute_type = "float16" if torch.cuda.is_available() else "float32"
+        
+        # 翻译配置
         self.chat_url = "https://api.openai.com/v1"
         self.chat_key = ""
         self.chat_model_list = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"]
@@ -41,66 +46,84 @@ class AppState:
 
 app_state = AppState()
 
-def load_config(config_file):
-    """加载配置文件"""
-    if config_file is None:
-        return "请选择配置文件", gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-    
-    try:
-        with open(config_file.name, 'r', encoding='utf-8') as f:
-            config_data = json.load(f)
-        
-        app_state.config = config_data
-        
-        # 更新各种配置
-        model_name = config_data.get("model_name", app_state.model_name)
-        chat_url = config_data.get("chat_url", app_state.chat_url)
-        chat_key = config_data.get("chat_key", app_state.chat_key)
-        chat_model = config_data.get("chat_model_name", app_state.chat_model_name)
-        baidu_appid = config_data.get("baidu_appid", app_state.baidu_appid)
-        baidu_appkey = config_data.get("baidu_appkey", app_state.baidu_appkey)
-        tencent_appid = config_data.get("tencent_appid", app_state.tencent_appid)
-        tencent_secretkey = config_data.get("tencent_secretKey", app_state.tencent_secretKey)
-        
-        return ("配置文件加载成功！", 
-                gr.update(value=model_name),
-                gr.update(value=chat_url),
-                gr.update(value=chat_key),
-                gr.update(value=chat_model),
-                gr.update(value=baidu_appid),
-                gr.update(value=baidu_appkey),
-                gr.update(value=tencent_appid),
-                gr.update(value=tencent_secretkey))
-    except Exception as e:
-        return f"配置文件加载失败: {str(e)}", gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
-def load_model(model_name, device_name, custom_model_path=None):
+
+def load_model(model_path, device_name, compute_type="auto"):
     """加载转录模型"""
     try:
         if app_state.transcribe is not None:
             del app_state.transcribe
         
-        # 优先使用自定义模型路径
-        if custom_model_path and os.path.exists(custom_model_path):
-            print(f"加载自定义本地模型：{custom_model_path}")
-            app_state.transcribe = Transcribe(model_name=custom_model_path, device=device_name)
-            model_display_name = os.path.basename(custom_model_path)
-            return f"自定义模型加载成功：{model_display_name} (设备: {device_name})"
+        # 检查模型路径
+        if model_path and model_path.strip():
+            model_path = model_path.strip()
+            print(f"尝试加载模型：{model_path}")
+            
+            # 如果是本地路径，检查是否存在
+            if not model_path.startswith(('tiny', 'base', 'small', 'medium', 'large')):
+                if not os.path.exists(model_path):
+                    return f"模型路径不存在：{model_path}"
+                
+                if not os.path.isdir(model_path):
+                    return f"模型路径必须是目录：{model_path}"
+                
+                # 检查目录中是否包含必要的模型文件
+                required_files = ['config.json']
+                model_files = ['model.bin', 'pytorch_model.bin', 'model.safetensors']
+                
+                # 检查配置文件
+                if not any(os.path.exists(os.path.join(model_path, f)) for f in required_files):
+                    return f"模型目录缺少配置文件 (config.json)：{model_path}"
+                
+                # 检查模型文件
+                existing_model_files = [f for f in model_files if os.path.exists(os.path.join(model_path, f))]
+                if not existing_model_files:
+                    available_files = [f for f in os.listdir(model_path) if f.endswith(('.bin', '.safetensors', '.pt', '.pth'))]
+                    if available_files:
+                        return f"模型目录包含模型文件但格式不匹配：{available_files}\n支持的格式：{model_files}\n路径：{model_path}"
+                    else:
+                        return f"模型目录缺少模型文件 (model.bin/pytorch_model.bin/model.safetensors)：{model_path}"
+                
+                print(f"找到模型文件：{existing_model_files}")
         
-        # 检查标准模型路径
-        models_path = "./models" + "/faster-whisper-" + model_name
+        # 检查标准模型的本地路径
+        if model_path in app_state.model_list:
+            models_path = f"./models/faster-whisper-{model_path}"
+            direct_model_path = f"./models/{model_path}"
+            
+            if os.path.exists(models_path):
+                print(f"加载本地模型：{models_path}")
+                model_path = models_path
+            elif os.path.exists(direct_model_path):
+                print(f"加载本地模型：{direct_model_path}")
+                model_path = direct_model_path
+            else:
+                print(f"加载HuggingFace模型：{model_path}")
         
-        if os.path.exists(models_path):
-            print(f"加载本地模型：{models_path}")
-            app_state.transcribe = Transcribe(model_name=models_path, device=device_name)
-        else:
-            print(f"加载HuggingFace模型：{model_name}")
-            app_state.transcribe = Transcribe(model_name=model_name, device=device_name)
+        # 创建Transcribe实例
+        app_state.transcribe = Transcribe(model_name=model_path, device=device_name)
         
-        app_state.model_name = model_name
-        return f"模型加载成功：{model_name} (设备: {device_name})"
+        # 保存配置
+        app_state.model_name = model_path
+        app_state.device_name = device_name
+        app_state.compute_type = compute_type
+        
+        model_display_name = os.path.basename(model_path) if os.path.exists(model_path) else model_path
+        return f"模型加载成功：{model_display_name} (设备: {device_name})"
+        
     except Exception as e:
-        return f"模型加载失败：{str(e)}"
+        error_msg = f"模型加载失败：{str(e)}"
+        print(f"[ERROR] {error_msg}")
+        
+        # 提供针对性的错误建议
+        if 'model.bin' in str(e):
+            error_msg += "\n\n建议解决方案：\n1. 检查模型目录是否包含正确的文件\n2. 确保模型文件完整下载\n3. 尝试重新下载模型\n4. 检查文件权限"
+        elif 'CUDA' in str(e) or 'cuda' in str(e):
+            error_msg += "\n\n建议解决方案：\n1. 检查CUDA是否正确安装\n2. 尝试使用CPU设备\n3. 检查GPU内存是否足够"
+        elif 'Invalid input features shape' in str(e):
+            error_msg += "\n\n建议解决方案：\n1. 模型特征维度不匹配，可能是版本兼容性问题\n2. 尝试使用标准模型名称如 'large-v3'\n3. 更新faster-whisper和ctranslate2到最新版本\n4. 检查模型是否为正确的Whisper架构"
+        
+        return error_msg
 
 def clear_cache():
     """清空缓存"""
@@ -172,36 +195,61 @@ def clean_audio():
     try:
         if app_state.uvr_client is None:
             print("[INFO] 开始加载UVR模型...")
-            app_state.uvr_client = UVR_Client()
-            print("[INFO] UVR模型加载完成")
+            try:
+                app_state.uvr_client = UVR_Client()
+                
+                # 检查UVR是否可用
+                if not hasattr(app_state.uvr_client, 'uvr_available') or not app_state.uvr_client.uvr_available:
+                    print("[WARNING] UVR模型不可用，跳过音频清洁")
+                    return f"UVR模型不可用，已跳过音频清洁步骤\n\n原始音频文件: {app_state.audio_temp}\n您可以直接使用此音频进行字幕生成", app_state.audio_temp
+                
+                print("[INFO] UVR模型加载完成")
+            except Exception as uvr_init_error:
+                # UVR初始化失败时，返回原始音频
+                error_str = str(uvr_init_error)
+                print(f"[WARNING] UVR模型初始化失败: {error_str}")
+                return f"UVR模型初始化失败，已跳过音频清洁步骤\n\n错误信息: {error_str}\n\n原始音频文件: {app_state.audio_temp}\n您可以直接使用此音频进行字幕生成", app_state.audio_temp
         
         print(f"[INFO] 开始处理音频文件: {app_state.audio_temp}")
-        primary_stem_output_path, secondary_stem_output_path = app_state.uvr_client.infer(app_state.audio_temp)
-        app_state.audio_separator_temp = os.path.join('./temp', secondary_stem_output_path)
         
-        print(f"[INFO] 音频清洁完成，输出文件: {app_state.audio_separator_temp}")
-        return "音频清洁完成", app_state.audio_separator_temp
+        # 检查音频文件是否存在
+        if not os.path.exists(app_state.audio_temp):
+            return f"音频文件不存在：{app_state.audio_temp}", None
+        
+        # 检查音频文件大小
+        file_size = os.path.getsize(app_state.audio_temp)
+        if file_size == 0:
+            return "音频文件为空，请重新上传", None
+        elif file_size < 1024:  # 小于1KB
+            return "音频文件过小，可能损坏，请重新上传", None
+        
+        try:
+            primary_stem_output_path, secondary_stem_output_path = app_state.uvr_client.infer(app_state.audio_temp)
+            app_state.audio_separator_temp = os.path.join('./temp', secondary_stem_output_path)
+            
+            # 检查输出文件是否生成成功
+            if not os.path.exists(app_state.audio_separator_temp):
+                print("[WARNING] 音频清洁失败，使用原始音频")
+                return f"音频清洁失败，使用原始音频\n\n原始音频: {app_state.audio_temp}\n您可以直接进行字幕生成", app_state.audio_temp
+            
+            output_size = os.path.getsize(app_state.audio_separator_temp)
+            if output_size == 0:
+                print("[WARNING] 输出文件为空，使用原始音频")
+                return f"音频清洁失败，使用原始音频\n\n原始音频: {app_state.audio_temp}\n您可以直接进行字幕生成", app_state.audio_temp
+            
+            print(f"[INFO] 音频清洁完成，输出文件: {app_state.audio_separator_temp}")
+            return "音频清洁完成", app_state.audio_separator_temp
+            
+        except Exception as infer_error:
+            error_str = str(infer_error)
+            print(f"[WARNING] 音频处理过程失败: {error_str}")
+            return f"音频处理失败，使用原始音频\n\n错误信息: {error_str}\n\n原始音频: {app_state.audio_temp}\n您可以直接进行字幕生成", app_state.audio_temp
+        
     except Exception as e:
-        # 获取完整的错误堆栈信息
-        error_traceback = traceback.format_exc()
-        error_msg = f"音频清洁失败：{str(e)}"
-        
-        # 在终端输出详细错误信息
-        print(f"[ERROR] {error_msg}")
-        print(f"[ERROR] 详细错误信息:")
-        print(error_traceback)
-        
-        # 针对特定错误提供解决建议
-        if 'roformer_download_list' in str(e).lower() or 'audio-separator库版本不兼容' in str(e):
-            suggestion = "\n建议解决方案：\n1. 这是audio-separator库版本兼容性问题\n2. 请执行以下命令修复：\n   pip uninstall audio-separator\n   pip install audio-separator==0.16.5\n3. 重启应用程序\n4. 如果问题持续，请检查Python环境"
-            print(f"[SUGGESTION] {suggestion}")
-            error_msg += suggestion
-        elif 'model' in str(e).lower():
-            suggestion = "\n建议解决方案：\n1. 检查 models/uvr5_weights 目录下的模型文件\n2. 重新下载模型文件\n3. 检查模型文件权限"
-            print(f"[SUGGESTION] {suggestion}")
-            error_msg += suggestion
-        
-        return error_msg, None
+        # 任何其他错误，都返回原始音频
+        error_str = str(e)
+        print(f"[WARNING] 音频清洁过程中发生错误: {error_str}")
+        return f"音频清洁过程中发生错误，使用原始音频\n\n错误信息: {error_str}\n\n原始音频: {app_state.audio_temp}\n您可以直接进行字幕生成", app_state.audio_temp
 
 def toggle_model_source(model_source):
     """切换模型来源显示"""
@@ -234,7 +282,130 @@ def setup_translation(translation_type, chat_url, chat_key, chat_model, baidu_ap
     except Exception as e:
         return f"翻译引擎设置失败：{str(e)}"
 
-def process_subtitle(language, vad_filter, min_silence_duration, text_split, split_method, prompt, show_video):
+def simple_transcribe_audio(audio_file, language, mode="transcribe", enable_translation="启用"):
+    """简单音频转录功能"""
+    try:
+        if not audio_file:
+            return "❌ 请先上传音频文件", "", None
+        
+        if app_state.transcribe is None:
+            return "❌ 请先在模型管理页面加载模型", "", None
+        
+        # 语言映射
+        language_map = {
+            "中文": "zh",
+            "日文": "ja", 
+            "英文": "en",
+            "自动检测": None
+        }
+        
+        # 执行转录
+        lang_code = language_map.get(language)
+        
+        try:
+            # 根据模式选择任务类型
+            task = "translate" if mode == "translate" else "transcribe"
+            
+            srt, ass = app_state.transcribe.run(
+                file_name=audio_file,
+                audio_binary_io=audio_file,
+                language=lang_code,
+                task=task,
+                is_vad_filter=False,
+                is_split=False
+            )
+            
+            # 从SRT文件中提取纯文本
+            text_content = ""
+            if os.path.exists(srt):
+                with open(srt, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        line = line.strip()
+                        # 跳过序号行、时间戳行和空行
+                        if line and not line.isdigit() and '-->' not in line:
+                            text_content += line + "\n"
+            
+            # 处理翻译模式的结果
+            if mode == "translate":
+                # 检查是否为标准Whisper模型
+                model_name = getattr(app_state.transcribe.model, 'model_path', str(app_state.transcribe.model))
+                is_standard_model = any(std_model in str(model_name).lower() for std_model in 
+                                      ['tiny', 'base', 'small', 'medium', 'large-v1', 'large-v2', 'large-v3'])
+                
+                if is_standard_model:
+                    # 标准模型：Whisper已翻译为英文
+                    text_content = f"🔄 Whisper翻译结果（英文）：\n{text_content}"
+                    
+                    # 根据用户设置决定是否使用外部翻译引擎
+                    if enable_translation == "启用" and app_state.engine is not None:
+                        try:
+                            from translation import translation
+                            t = translation(app_state.engine)
+                            translate_ass, translate_srt = t.translate_save(ass)
+                            
+                            # 从翻译后的SRT文件中提取文本
+                            if os.path.exists(translate_srt):
+                                with open(translate_srt, 'r', encoding='utf-8') as f:
+                                    lines = f.readlines()
+                                    translated_content = ""
+                                    for line in lines:
+                                        line = line.strip()
+                                        if line and not line.isdigit() and '-->' not in line:
+                                            translated_content += line + "\n"
+                                text_content += f"\n\n🔄 外部翻译引擎结果：\n{translated_content}"
+                        except Exception as e:
+                            text_content += f"\n\n⚠️ 外部翻译失败：{str(e)}"
+                    elif enable_translation == "禁用":
+                        text_content += "\n\n💡 提示：外部翻译引擎已禁用，如需翻译为其他语言请启用外部翻译"
+                    else:
+                        text_content += "\n\n💡 提示：如需翻译为中文等其他语言，请先设置外部翻译引擎"
+                else:
+                    # 微调模型：可能已直接翻译为目标语言
+                    text_content = f"🔄 微调模型翻译结果：\n{text_content}"
+                    
+                    # 微调模型也可以选择使用外部翻译引擎优化质量
+                    if enable_translation == "启用" and app_state.engine is not None:
+                        try:
+                            from translation import translation
+                            t = translation(app_state.engine)
+                            translate_ass, translate_srt = t.translate_save(ass)
+                            
+                            # 从翻译后的SRT文件中提取文本
+                            if os.path.exists(translate_srt):
+                                with open(translate_srt, 'r', encoding='utf-8') as f:
+                                    lines = f.readlines()
+                                    translated_content = ""
+                                    for line in lines:
+                                        line = line.strip()
+                                        if line and not line.isdigit() and '-->' not in line:
+                                            translated_content += line + "\n"
+                                text_content += f"\n\n🔄 外部翻译引擎优化结果：\n{translated_content}"
+                        except Exception as e:
+                            text_content += f"\n\n⚠️ 外部翻译失败：{str(e)}"
+                    elif enable_translation == "启用":
+                        text_content += "\n\n💡 提示：如需外部翻译引擎优化，请先设置翻译引擎"
+                    else:
+                        text_content += "\n\n💡 提示：微调模型已尝试直接翻译，如需更好质量可启用外部翻译引擎"
+            
+            # 保存文本文件
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            mode_suffix = "_translated" if mode == "translate" else ""
+            txt_file = os.path.join(TEMP, f"transcription_{timestamp}{mode_suffix}.txt")
+            with open(txt_file, 'w', encoding='utf-8') as f:
+                f.write(text_content)
+            
+            return f"✅ {mode.capitalize()}完成！", text_content.strip(), txt_file
+            
+        except Exception as e:
+            return f"❌ {mode.capitalize()}失败: {str(e)}", "", None
+        
+    except Exception as e:
+        error_msg = f"❌ {mode.capitalize()}失败: {str(e)}"
+        print(f"音频转录时出错: {e}")
+        return error_msg, "", None
+
+def process_subtitle(language, subtitle_mode, vad_filter, min_silence_duration, text_split, split_method, prompt, enable_translation, translation_engine, subtitle_chat_url, subtitle_chat_key, subtitle_chat_model, subtitle_baidu_appid, subtitle_baidu_appkey, subtitle_tencent_appid, subtitle_tencent_secretkey, show_video, target_language="中文"):
     """处理字幕生成"""
     if app_state.transcribe is None:
         return "请先加载模型", None, None, None
@@ -262,19 +433,100 @@ def process_subtitle(language, vad_filter, min_silence_duration, text_split, spl
         # 提示词处理
         initial_prompt = prompt if prompt.strip() else None
         
-        print(f"开始处理音频：{input_audio}")
+        print(f"[INFO] 开始处理音频：{input_audio}")
+        print(f"[INFO] 转录参数 - 语言: {lang_code}, VAD: {is_vad_filter}, 分割: {is_split}")
+        
+        # 设置翻译引擎（如果启用翻译）
+        if enable_translation == "是":
+            try:
+                setup_translation(translation_engine, subtitle_chat_url, subtitle_chat_key, subtitle_chat_model, subtitle_baidu_appid, subtitle_baidu_appkey, subtitle_tencent_appid, subtitle_tencent_secretkey)
+            except Exception as e:
+                print(f"[WARNING] 翻译引擎设置失败: {e}")
         
         # 生成字幕
-        srt, ass = app_state.transcribe.run(
-            file_name=input_audio,
-            audio_binary_io=input_audio,
-            language=lang_code,
-            is_vad_filter=is_vad_filter,
-            min_silence_duration_ms=min_silence_ms,
-            is_split=is_split,
-            split_method=split_method,
-            initial_prompt=initial_prompt
-        )
+        try:
+            # 根据模式选择任务类型
+            task = "translate" if subtitle_mode == "translate" else "transcribe"
+            
+            # 对于translate模式，尝试直接翻译到目标语言
+            # 如果是微调模型，可能支持直接翻译到目标语言
+            # 如果是标准模型，则只能翻译到英文，需要后续外部翻译
+            whisper_target_lang = None
+            if subtitle_mode == "translate":
+                # 检查是否为标准Whisper模型（这些模型只能翻译为英文）
+                model_name = getattr(app_state.transcribe.model, 'model_path', str(app_state.transcribe.model))
+                is_standard_model = any(std_model in str(model_name).lower() for std_model in 
+                                      ['tiny', 'base', 'small', 'medium', 'large-v1', 'large-v2', 'large-v3'])
+                
+                if is_standard_model:
+                    # 标准模型只能翻译为英文
+                    whisper_target_lang = "en"
+                    print(f"[INFO] 使用标准Whisper模型，翻译为英文")
+                else:
+                    # 微调模型可能支持直接翻译到目标语言
+                    target_lang_map = {"中文": "zh", "日文": "ja", "英文": "en"}
+                    whisper_target_lang = target_lang_map.get(target_language, "en")
+                    print(f"[INFO] 使用微调模型，尝试直接翻译到{target_language} ({whisper_target_lang})")
+            
+            srt, ass = app_state.transcribe.run(
+                file_name=input_audio,
+                audio_binary_io=input_audio,
+                language=lang_code,
+                task=task,
+                is_vad_filter=is_vad_filter,
+                min_silence_duration_ms=min_silence_ms,
+                is_split=is_split,
+                split_method=split_method,
+                initial_prompt=initial_prompt
+            )
+            print(f"[INFO] 字幕生成成功 - 任务类型: {task}")
+            
+            # 判断是否需要外部翻译
+            need_external_translation = False
+            if subtitle_mode == "translate":
+                # 检查是否为标准模型且目标语言不是英文
+                model_name = getattr(app_state.transcribe.model, 'model_path', str(app_state.transcribe.model))
+                is_standard_model = any(std_model in str(model_name).lower() for std_model in 
+                                      ['tiny', 'base', 'small', 'medium', 'large-v1', 'large-v2', 'large-v3'])
+                
+                if is_standard_model and target_language != "英文":
+                    need_external_translation = True
+                    print(f"[INFO] 标准模型已翻译为英文，需要外部翻译引擎翻译为{target_language}")
+                elif not is_standard_model:
+                    print(f"[INFO] 微调模型已尝试直接翻译为{target_language}")
+            
+            # 处理外部翻译需求
+            if need_external_translation:
+                if enable_translation != "是" or app_state.engine is None:
+                    print(f"[WARNING] 需要外部翻译引擎将英文翻译为{target_language}，但翻译引擎未启用")
+                    result_message = f"⚠️ 注意：Whisper已将音频翻译为英文字幕\n要翻译为{target_language}，请启用外部翻译引擎"
+                else:
+                    # 使用外部翻译引擎进一步翻译
+                    enable_translation = "是"  # 确保后续翻译逻辑执行
+        except Exception as transcribe_error:
+            error_msg = str(transcribe_error)
+            print(f"[ERROR] 字幕转录过程失败: {error_msg}")
+            
+            # 提供用户友好的错误信息
+            if "Invalid input features shape" in error_msg:
+                user_error_msg = f"模型输入特征不匹配错误\n\n" + \
+                               f"错误详情: {error_msg}\n\n" + \
+                               f"解决方案:\n" + \
+                               f"1. 当前模型可能不兼容，请尝试使用标准模型名称如 'large-v3'\n" + \
+                               f"2. 如果使用自定义模型，请确保是正确的CTranslate2格式\n" + \
+                               f"3. 尝试切换到CPU设备\n" + \
+                               f"4. 检查模型文件是否完整下载"
+            elif "CUDA" in error_msg or "cuda" in error_msg:
+                user_error_msg = f"GPU/CUDA错误\n\n" + \
+                               f"错误详情: {error_msg}\n\n" + \
+                               f"解决方案:\n" + \
+                               f"1. 尝试切换到CPU设备\n" + \
+                               f"2. 检查CUDA和cuDNN版本\n" + \
+                               f"3. 重启程序释放GPU内存"
+            else:
+                user_error_msg = f"字幕生成失败\n\n错误详情: {error_msg}\n\n请检查终端输出获取详细信息"
+            
+            return user_error_msg, None, None, None
         
         # 创建下载包
         zip_name = os.path.splitext(os.path.basename(app_state.audio_temp))[0] + ".zip"
@@ -284,18 +536,41 @@ def process_subtitle(language, vad_filter, min_silence_duration, text_split, spl
             zipObj.write(srt, os.path.basename(srt))
             zipObj.write(ass, os.path.basename(ass))
             
-            # 如果需要翻译
-            if app_state.engine is not None:
-                print("开始翻译...")
+            # 如果启用翻译且有翻译引擎
+            if enable_translation == "是" and app_state.engine is not None:
+                print(f"开始翻译到{target_language}...")
                 t = translation(app_state.engine)
-                translate_ass, translate_srt = t.translate_save(ass)
+                translate_ass, translate_srt = t.translate_save(ass, language=target_language)
                 zipObj.write(translate_ass, os.path.basename(translate_ass))
                 zipObj.write(translate_srt, os.path.basename(translate_srt))
         
-        result_message = f"字幕生成完成！\n原始字幕：{os.path.basename(srt)}\n"
-        if app_state.engine is not None:
-            result_message += "翻译字幕已生成\n"
-        result_message += "\n可以使用 Aegisub 进行后期编辑优化"
+        # 生成结果消息
+        if subtitle_mode == "translate":
+            # 检查模型类型
+            model_name = getattr(app_state.transcribe.model, 'model_path', str(app_state.transcribe.model))
+            is_standard_model = any(std_model in str(model_name).lower() for std_model in 
+                                  ['tiny', 'base', 'small', 'medium', 'large-v1', 'large-v2', 'large-v3'])
+            
+            if target_language == "英文":
+                result_message = f"✅ 字幕翻译完成！\n🔄 Whisper已将音频翻译为英文字幕\n📄 字幕文件：{os.path.basename(srt)}\n"
+            elif is_standard_model:
+                # 标准模型的处理
+                if enable_translation == "是" and app_state.engine is not None:
+                    result_message = f"✅ 字幕翻译完成！\n🔄 标准Whisper模型翻译为英文 → 外部引擎翻译为{target_language}\n📄 原始字幕：{os.path.basename(srt)}\n📄 翻译字幕已生成\n"
+                else:
+                    result_message = f"⚠️ 部分完成！\n🔄 标准Whisper模型已将音频翻译为英文字幕\n📄 字幕文件：{os.path.basename(srt)}\n💡 要翻译为{target_language}，请启用外部翻译引擎\n"
+            else:
+                # 微调模型的处理
+                if enable_translation == "是" and app_state.engine is not None:
+                    result_message = f"✅ 字幕翻译完成！\n🔄 微调模型直接翻译为{target_language} + 外部引擎优化\n📄 原始字幕：{os.path.basename(srt)}\n📄 翻译字幕已生成\n"
+                else:
+                    result_message = f"✅ 字幕翻译完成！\n🔄 微调模型已尝试直接翻译为{target_language}\n📄 字幕文件：{os.path.basename(srt)}\n💡 如需更好的翻译质量，可启用外部翻译引擎\n"
+        else:
+            result_message = f"✅ 字幕转录完成！\n📄 字幕文件：{os.path.basename(srt)}\n"
+            if enable_translation == "是" and app_state.engine is not None:
+                result_message += f"📄 翻译字幕已生成（翻译为{target_language}）\n"
+        
+        result_message += "\n🎬 可以使用 Aegisub 进行后期编辑优化"
         
         # 生成带字幕的视频（如果需要）
         output_video = None
@@ -324,20 +599,16 @@ def create_interface():
         gr.Markdown("基于Whisper的智能字幕生成工具，支持多种语言识别和翻译")
         
         with gr.Tabs():
-            # 配置标签页
-            with gr.TabItem("⚙️ 配置管理"):
-                gr.Markdown("### 配置文件管理")
-                with gr.Row():
-                    config_file = gr.File(label="上传配置文件 (JSON)", file_types=[".json"])
-                    clear_btn = gr.Button("🗑️ 清空缓存", variant="secondary")
-                
-                config_status = gr.Textbox(label="配置状态", interactive=False)
-                
+            # 第一个标签页：模型管理
+            with gr.TabItem("⚙️ 模型管理"):
                 gr.Markdown("### 模型配置")
                 gr.Markdown(
                     "如果本地models目录中没有模型，将自动从HuggingFace下载。\n"
                     "也可以手动下载模型到models目录，或选择自定义微调模型。\n"
                 )
+                
+                with gr.Row():
+                    clear_btn = gr.Button("🗑️ 清空缓存", variant="secondary")
                 
                 # 模型选择方式
                 model_source = gr.Radio(
@@ -356,41 +627,139 @@ def create_interface():
                         )
                         device_name = gr.Dropdown(
                             choices=["cpu", "cuda"],
-                            value="cuda",
-                            label="计算设备（强烈建议使用CUDA加速）"
+                            value=app_state.device_name,
+                            label="计算设备"
+                        )
+                        compute_type = gr.Dropdown(
+                            choices=["int8", "int8_float16", "int16", "float16", "float32"],
+                            value=app_state.compute_type,
+                            label="计算类型"
                         )
                 
                 # 自定义模型选择
                 with gr.Group(visible=False) as custom_model_group:
-                    gr.Markdown(
-                        "#### 📝 自定义模型使用说明\n"
-                        "- **faster-whisper格式**：包含config.json、model.bin、tokenizer.json等文件的文件夹\n"
-                        "- **HuggingFace格式**：包含pytorch_model.bin、config.json、tokenizer.json等文件的文件夹\n"
-                        "- **支持微调模型**：使用OpenAI Whisper、faster-whisper或transformers库训练的模型\n"
-                        "- **路径示例**：`./models/my-whisper-model` 或 `D:/models/fine-tuned-whisper`"
-                    )
                     custom_model_path = gr.Textbox(
                         label="自定义模型路径",
-                        placeholder="请输入本地微调模型的文件夹路径，例如：./models/my-fine-tuned-whisper",
+                        placeholder="请输入本地微调模型的文件夹路径",
                         info="支持faster-whisper格式和HuggingFace transformers格式的本地模型"
                     )
-                    custom_device_name = gr.Dropdown(
-                        choices=["cpu", "cuda"],
-                        value="cuda",
-                        label="计算设备（强烈建议使用CUDA加速）"
-                    )
+                    with gr.Row():
+                        custom_device_name = gr.Dropdown(
+                            choices=["cpu", "cuda"],
+                            value=app_state.device_name,
+                            label="计算设备"
+                        )
+                        custom_compute_type = gr.Dropdown(
+                            choices=["int8", "int8_float16", "int16", "float16", "float32"],
+                            value=app_state.compute_type,
+                            label="计算类型"
+                        )
                 
                 load_model_btn = gr.Button("🚀 加载模型", variant="primary")
                 model_status = gr.Textbox(label="模型状态", interactive=False)
             
-            # 媒体上传标签页
-            with gr.TabItem("📁 媒体上传"):
-                gr.Markdown("### 选择媒体类型")
-                media_type = gr.Radio(
-                    choices=["视频", "音频"],
-                    value="视频",
-                    label="媒体类型（支持视频格式：mp4, avi, mov, mkv；音频格式：mp3, wav, m4a）"
-                )
+            # 第二个标签页：音频转录
+            with gr.TabItem("🎤 音频转录"):
+                gr.Markdown("### 音频转录")
+                gr.Markdown("上传音频文件，使用已加载的模型进行转录或翻译")
+                
+                with gr.Row():
+                    with gr.Column():
+                        audio_input = gr.Audio(
+                            label="上传音频文件",
+                            type="filepath",
+                            sources=["upload"]
+                        )
+                        
+                        with gr.Row():
+                            audio_language = gr.Dropdown(
+                                choices=["中文", "日文", "英文", "自动检测"],
+                                value="自动检测",
+                                label="音频语言"
+                            )
+                            
+                            audio_mode = gr.Radio(
+                                choices=["transcribe", "translate"],
+                                value="transcribe",
+                                label="处理模式",
+                                info="transcribe: 转录原语言 | translate: 标准模型翻译为英文，微调模型可直接翻译"
+                            )
+                        
+                        # 翻译引擎配置（仅在translate模式下显示）
+                        with gr.Group(visible=False) as audio_translation_config:
+                            gr.Markdown("#### 外部翻译引擎配置")
+                            gr.Markdown("💡 **说明**: 标准模型需要外部翻译将英文翻译为其他语言；微调模型可选择启用以获得更好的翻译质量。")
+                            
+                            audio_enable_translation = gr.Radio(
+                                choices=["启用", "禁用"],
+                                value="启用",
+                                label="外部翻译引擎",
+                                info="是否启用外部翻译引擎进行二次翻译"
+                            )
+                            
+                            with gr.Group() as audio_translation_engine_config:
+                                audio_translation_type = gr.Radio(
+                                    choices=["GPT翻译", "百度翻译", "腾讯翻译"],
+                                    value="GPT翻译",
+                                    label="翻译引擎"
+                                )
+                            
+                            # GPT翻译配置
+                            with gr.Group(visible=True) as audio_gpt_config:
+                                with gr.Row():
+                                    audio_chat_url = gr.Textbox(
+                                        label="Base URL",
+                                        value="https://api.openai.com/v1",
+                                        type="password"
+                                    )
+                                    audio_chat_key = gr.Textbox(
+                                        label="API Key",
+                                        type="password"
+                                    )
+                                audio_chat_model = gr.Dropdown(
+                                    choices=["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
+                                    value="gpt-4-turbo",
+                                    label="模型选择"
+                                )
+                            
+                            # 百度翻译配置
+                            with gr.Group(visible=False) as audio_baidu_config:
+                                with gr.Row():
+                                    audio_baidu_appid = gr.Textbox(label="AppID", type="password")
+                                    audio_baidu_appkey = gr.Textbox(label="AppKey", type="password")
+                            
+                            # 腾讯翻译配置
+                            with gr.Group(visible=False) as audio_tencent_config:
+                                with gr.Row():
+                                    audio_tencent_appid = gr.Textbox(label="AppID", type="password")
+                                    audio_tencent_secretkey = gr.Textbox(label="SecretKey", type="password")
+                            
+                            audio_setup_translation_btn = gr.Button("🔧 设置翻译引擎", variant="secondary")
+                        
+                        transcribe_btn = gr.Button("🚀 开始处理", variant="primary")
+                    
+                    with gr.Column():
+                        transcribe_result = gr.Textbox(
+                            label="处理结果",
+                            lines=15,
+                            max_lines=20,
+                            interactive=False
+                        )
+                        
+                        download_txt = gr.File(label="下载文本文件")
+                
+                transcribe_status = gr.Textbox(label="处理状态", interactive=False)
+            
+            # 第三个标签页：字幕生成
+            with gr.TabItem("🎬 字幕生成"):
+                gr.Markdown("### 媒体上传")
+                
+                with gr.Row():
+                    media_type = gr.Radio(
+                        choices=["视频", "音频"],
+                        value="视频",
+                        label="媒体类型（支持视频格式：mp4, avi, mov, mkv；音频格式：mp3, wav, m4a）"
+                    )
                 
                 media_file = gr.File(
                     label="上传媒体文件",
@@ -406,14 +775,19 @@ def create_interface():
                     
                     with gr.Column():
                         gr.Markdown("#### 清洁音频（可选）")
+                        gr.Markdown(
+                            "💡 **音频清洁功能说明**\n"
+                            "- 使用UVR技术分离人声和背景音乐\n"
+                            "- 首次使用会自动下载模型文件\n"
+                            "- 如遇到模型加载失败，请检查网络连接\n"
+                            "- 建议使用audio-separator==0.16.5版本"
+                        )
                         clean_audio_btn = gr.Button("🧹 音频清洁（去除背景音乐，提高识别准确度）")
                         cleaned_audio = gr.Audio(label="清洁后的音频", interactive=False)
                 
                 clean_status = gr.Textbox(label="清洁状态", interactive=False)
-            
-            # 转录配置标签页
-            with gr.TabItem("🎯 转录配置"):
-                gr.Markdown("### 语言和处理设置")
+                
+                gr.Markdown("### 转录配置")
                 
                 with gr.Row():
                     language = gr.Dropdown(
@@ -422,10 +796,33 @@ def create_interface():
                         label="媒体语言（选择音频/视频的主要语言）"
                     )
                     
+                    subtitle_mode = gr.Radio(
+                        choices=["transcribe", "translate"],
+                        value="transcribe",
+                        label="字幕模式",
+                        info="transcribe: 转录原语言 | translate: 标准模型翻译为英文，微调模型可直接翻译为目标语言"
+                    )
+                    
+                    # 目标翻译语言选择（仅在translate模式下显示）
+                    target_language = gr.Dropdown(
+                        choices=["中文", "英文", "日文", "韩文", "法文", "德文", "西班牙文", "俄文"],
+                        value="中文",
+                        label="最终目标语言",
+                        info="标准模型: Whisper翻译为英文→外部引擎翻译为此语言 | 微调模型: 可能直接翻译为此语言",
+                        visible=False
+                    )
+                
+                with gr.Row():
                     vad_filter = gr.Radio(
                         choices=["是", "否"],
-                        value="否",
+                        value="是",
                         label="启用VAD过滤（过滤无声段落，避免识别出无意义内容）"
+                    )
+                    
+                    text_split = gr.Radio(
+                        choices=["是", "否"],
+                        value="是",
+                        label="文本分割（当单行文本过长时启用）"
                     )
                 
                 min_silence_duration = gr.Slider(
@@ -437,19 +834,12 @@ def create_interface():
                     visible=False
                 )
                 
-                with gr.Row():
-                    text_split = gr.Radio(
-                        choices=["是", "否"],
-                        value="否",
-                        label="文本分割（当单行文本过长时启用）"
-                    )
-                    
-                    split_method = gr.Dropdown(
-                        choices=["Modest", "Aggressive"],
-                        value="Modest",
-                        label="分割方式（Modest: 智能分割; Aggressive: 遇空格就分割）",
-                        visible=False
-                    )
+                split_method = gr.Dropdown(
+                    choices=["Modest", "Aggressive"],
+                    value="Modest",
+                    label="分割方式（Modest: 智能分割; Aggressive: 遇空格就分割）",
+                    visible=False
+                )
                 
                 prompt = gr.Textbox(
                     label="提示词（帮助模型更好地识别特定内容）",
@@ -461,57 +851,61 @@ def create_interface():
                     value="是",
                     label="生成带字幕视频（仅对视频文件有效）"
                 )
-            
-            # 翻译设置标签页
-            with gr.TabItem("🌐 翻译设置"):
-                gr.Markdown("### 翻译引擎配置")
                 
-                translation_type = gr.Radio(
-                    choices=["否", "GPT翻译", "百度翻译", "腾讯翻译"],
+                gr.Markdown("### 外部翻译设置")
+                gr.Markdown("💡 **说明**: 外部翻译用于优化翻译质量。标准模型需要此功能将英文翻译为其他语言；微调模型可选择启用以获得更好的翻译质量。")
+                
+                enable_translation = gr.Radio(
+                    choices=["否", "是"],
                     value="否",
-                    label="翻译选项（选择翻译服务，翻译为中文）"
+                    label="启用外部翻译引擎"
                 )
                 
-                # GPT翻译配置
-                with gr.Group(visible=False) as gpt_config:
-                    gr.Markdown("#### GPT翻译配置")
-                    with gr.Row():
-                        chat_url = gr.Textbox(
-                            label="Base URL",
-                            value="https://api.openai.com/v1",
-                            type="password"
-                        )
-                        chat_key = gr.Textbox(
-                            label="API Key",
-                            type="password"
-                        )
-                    chat_model = gr.Dropdown(
-                        choices=["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
-                        value="gpt-4-turbo",
-                        label="模型选择"
+                with gr.Group(visible=False) as subtitle_translation_config:
+                    translation_engine = gr.Radio(
+                        choices=["GPT翻译", "百度翻译", "腾讯翻译"],
+                        value="GPT翻译",
+                        label="翻译引擎"
                     )
+                    
+                    # GPT翻译配置
+                    with gr.Group(visible=True) as subtitle_gpt_config:
+                        gr.Markdown("#### GPT翻译配置")
+                        with gr.Row():
+                            subtitle_chat_url = gr.Textbox(
+                                label="Base URL",
+                                value="https://api.openai.com/v1",
+                                type="password"
+                            )
+                            subtitle_chat_key = gr.Textbox(
+                                label="API Key",
+                                type="password"
+                            )
+                        subtitle_chat_model = gr.Dropdown(
+                            choices=["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
+                            value="gpt-4-turbo",
+                            label="模型选择"
+                        )
+                    
+                    # 百度翻译配置
+                    with gr.Group(visible=False) as subtitle_baidu_config:
+                        gr.Markdown("#### 百度翻译配置")
+                        gr.Markdown("[申请地址](https://fanyi-api.baidu.com/manage/developer)")
+                        with gr.Row():
+                            subtitle_baidu_appid = gr.Textbox(label="AppID", type="password")
+                            subtitle_baidu_appkey = gr.Textbox(label="AppKey", type="password")
+                    
+                    # 腾讯翻译配置
+                    with gr.Group(visible=False) as subtitle_tencent_config:
+                        gr.Markdown("#### 腾讯翻译配置")
+                        gr.Markdown("[申请地址](https://console.cloud.tencent.com/tmt)")
+                        with gr.Row():
+                            subtitle_tencent_appid = gr.Textbox(label="AppID", type="password")
+                            subtitle_tencent_secretkey = gr.Textbox(label="SecretKey", type="password")
+                    
+                    subtitle_setup_translation_btn = gr.Button("🔧 设置翻译引擎", variant="secondary")
+                    subtitle_translation_status = gr.Textbox(label="翻译引擎状态", interactive=False)
                 
-                # 百度翻译配置
-                with gr.Group(visible=False) as baidu_config:
-                    gr.Markdown("#### 百度翻译配置")
-                    gr.Markdown("[申请地址](https://fanyi-api.baidu.com/manage/developer)")
-                    with gr.Row():
-                        baidu_appid = gr.Textbox(label="AppID", type="password")
-                        baidu_appkey = gr.Textbox(label="AppKey", type="password")
-                
-                # 腾讯翻译配置
-                with gr.Group(visible=False) as tencent_config:
-                    gr.Markdown("#### 腾讯翻译配置")
-                    gr.Markdown("[申请地址](https://console.cloud.tencent.com/tmt)")
-                    with gr.Row():
-                        tencent_appid = gr.Textbox(label="AppID", type="password")
-                        tencent_secretkey = gr.Textbox(label="SecretKey", type="password")
-                
-                setup_translation_btn = gr.Button("🔧 设置翻译引擎", variant="secondary")
-                translation_status = gr.Textbox(label="翻译引擎状态", interactive=False)
-            
-            # 处理结果标签页
-            with gr.TabItem("🎬 处理与结果"):
                 gr.Markdown("### 开始处理")
                 
                 process_btn = gr.Button("🚀 开始生成字幕", variant="primary", size="lg")
@@ -529,16 +923,8 @@ def create_interface():
         
         # 事件绑定
         
-        # 配置文件加载
-        config_file.change(
-            fn=load_config,
-            inputs=[config_file],
-            outputs=[config_status, model_name, chat_url, chat_key, chat_model, 
-                    baidu_appid, baidu_appkey, tencent_appid, tencent_secretkey]
-        )
-        
         # 清空缓存
-        clear_btn.click(fn=clear_cache, outputs=[config_status])
+        clear_btn.click(fn=clear_cache, outputs=[model_status])
         
         # 模型来源切换
         model_source.change(
@@ -548,17 +934,73 @@ def create_interface():
         )
         
         # 加载模型 - 动态处理预设模型和自定义模型
-        def handle_load_model(model_source, model_name, device_name, custom_model_path, custom_device_name):
+        def handle_load_model(model_source, model_name, device_name, compute_type, custom_model_path, custom_device_name, custom_compute_type):
             if model_source == "预设模型":
-                return load_model(model_name, device_name)
+                return load_model(model_name, device_name, compute_type)
             else:
-                return load_model(None, custom_device_name, custom_model_path)
+                return load_model(custom_model_path, custom_device_name, custom_compute_type)
         
         load_model_btn.click(
             fn=handle_load_model,
-            inputs=[model_source, model_name, device_name, custom_model_path, custom_device_name],
+            inputs=[model_source, model_name, device_name, compute_type, custom_model_path, custom_device_name, custom_compute_type],
             outputs=[model_status]
         )
+        
+        # 音频转录页面事件绑定
+        
+        # 音频模式切换
+        def toggle_audio_translation_config(mode):
+            return gr.update(visible=(mode == "translate"))
+        
+        audio_mode.change(
+            fn=toggle_audio_translation_config,
+            inputs=[audio_mode],
+            outputs=[audio_translation_config]
+        )
+        
+        # 音频外部翻译引擎配置显示/隐藏
+        def toggle_audio_translation_enable(enable_status):
+            return gr.update(visible=(enable_status == "启用"))
+        
+        audio_enable_translation.change(
+            fn=toggle_audio_translation_enable,
+            inputs=[audio_enable_translation],
+            outputs=[audio_translation_engine_config]
+        )
+        
+        # 音频翻译引擎配置显示/隐藏
+        def toggle_audio_translation_engine(engine_type):
+            return (
+                gr.update(visible=(engine_type == "GPT翻译")),
+                gr.update(visible=(engine_type == "百度翻译")),
+                gr.update(visible=(engine_type == "腾讯翻译"))
+            )
+        
+        audio_translation_type.change(
+            fn=toggle_audio_translation_engine,
+            inputs=[audio_translation_type],
+            outputs=[audio_gpt_config, audio_baidu_config, audio_tencent_config]
+        )
+        
+        # 音频翻译引擎设置
+        def setup_audio_translation(trans_type, url, key, model, baidu_id, baidu_key, tencent_id, tencent_key):
+            return setup_translation(trans_type, url, key, model, baidu_id, baidu_key, tencent_id, tencent_key)
+        
+        audio_setup_translation_btn.click(
+            fn=setup_audio_translation,
+            inputs=[audio_translation_type, audio_chat_url, audio_chat_key, audio_chat_model,
+                   audio_baidu_appid, audio_baidu_appkey, audio_tencent_appid, audio_tencent_secretkey],
+            outputs=[transcribe_status]
+        )
+        
+        # 音频转录
+        transcribe_btn.click(
+            fn=simple_transcribe_audio,
+            inputs=[audio_input, audio_language, audio_mode, audio_enable_translation],
+            outputs=[transcribe_status, transcribe_result, download_txt]
+        )
+        
+        # 字幕生成页面事件绑定
         
         # 媒体上传
         media_file.change(
@@ -594,32 +1036,58 @@ def create_interface():
         )
         
         # 翻译配置显示/隐藏
-        def toggle_translation_config(trans_type):
-            return (
-                gr.update(visible=(trans_type == "GPT翻译")),
-                gr.update(visible=(trans_type == "百度翻译")),
-                gr.update(visible=(trans_type == "腾讯翻译"))
-            )
+        def toggle_subtitle_translation_config(enable):
+            return gr.update(visible=(enable == "是"))
         
-        translation_type.change(
-            fn=toggle_translation_config,
-            inputs=[translation_type],
-            outputs=[gpt_config, baidu_config, tencent_config]
+        enable_translation.change(
+            fn=toggle_subtitle_translation_config,
+            inputs=[enable_translation],
+            outputs=[subtitle_translation_config]
         )
         
-        # 设置翻译引擎
-        setup_translation_btn.click(
-            fn=setup_translation,
-            inputs=[translation_type, chat_url, chat_key, chat_model,
-                   baidu_appid, baidu_appkey, tencent_appid, tencent_secretkey],
-            outputs=[translation_status]
+        # 目标语言选择显示/隐藏（仅在translate模式下显示）
+        def toggle_target_language(mode):
+            return gr.update(visible=(mode == "translate"))
+        
+        subtitle_mode.change(
+            fn=toggle_target_language,
+            inputs=[subtitle_mode],
+            outputs=[target_language]
+        )
+        
+        # 字幕翻译引擎配置显示/隐藏
+        def toggle_subtitle_translation_engine(engine_type):
+            return (
+                gr.update(visible=(engine_type == "GPT翻译")),
+                gr.update(visible=(engine_type == "百度翻译")),
+                gr.update(visible=(engine_type == "腾讯翻译"))
+            )
+        
+        translation_engine.change(
+            fn=toggle_subtitle_translation_engine,
+            inputs=[translation_engine],
+            outputs=[subtitle_gpt_config, subtitle_baidu_config, subtitle_tencent_config]
+        )
+        
+        # 字幕翻译引擎设置
+        def setup_subtitle_translation(trans_type, url, key, model, baidu_id, baidu_key, tencent_id, tencent_key):
+            return setup_translation(trans_type, url, key, model, baidu_id, baidu_key, tencent_id, tencent_key)
+        
+        subtitle_setup_translation_btn.click(
+            fn=setup_subtitle_translation,
+            inputs=[translation_engine, subtitle_chat_url, subtitle_chat_key, subtitle_chat_model,
+                   subtitle_baidu_appid, subtitle_baidu_appkey, subtitle_tencent_appid, subtitle_tencent_secretkey],
+            outputs=[subtitle_translation_status]
         )
         
         # 处理字幕
+        def handle_process_subtitle(language, subtitle_mode, vad_filter, min_silence_duration, text_split, split_method, prompt, enable_translation, translation_engine, subtitle_chat_url, subtitle_chat_key, subtitle_chat_model, subtitle_baidu_appid, subtitle_baidu_appkey, subtitle_tencent_appid, subtitle_tencent_secretkey, show_video, target_language):
+            return process_subtitle(language, subtitle_mode, vad_filter, min_silence_duration, text_split, split_method, prompt, enable_translation, translation_engine, subtitle_chat_url, subtitle_chat_key, subtitle_chat_model, subtitle_baidu_appid, subtitle_baidu_appkey, subtitle_tencent_appid, subtitle_tencent_secretkey, show_video, target_language)
+        
         process_btn.click(
-            fn=process_subtitle,
-            inputs=[language, vad_filter, min_silence_duration, text_split, 
-                   split_method, prompt, show_video],
+            fn=handle_process_subtitle,
+            inputs=[language, subtitle_mode, vad_filter, min_silence_duration, text_split, 
+                   split_method, prompt, enable_translation, translation_engine, subtitle_chat_url, subtitle_chat_key, subtitle_chat_model, subtitle_baidu_appid, subtitle_baidu_appkey, subtitle_tencent_appid, subtitle_tencent_secretkey, show_video, target_language],
             outputs=[process_status, download_file, subtitle_preview, result_video]
         )
     
