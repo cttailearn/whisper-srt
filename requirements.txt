@@ -16,7 +16,7 @@ torchaudio>=0.9.0
 
 # 音频处理
 ffmpeg-python>=0.2.0
-audio-separator==0.16.5
+audio-separator[gpu]==0.16.5
 
 # 翻译服务
 openai>=1.0.0
@@ -31,3 +31,4 @@ chardet==3.0.4
 # 2. 需要下载语音识别模型文件到./models/目录
 # 3. Windows用户可能需要安装Microsoft Visual C++ 14.0
 # 4. 已移除webrtcvad依赖，使用基于librosa的VAD实现
+
