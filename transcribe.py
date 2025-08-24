@@ -12,21 +12,26 @@ import pysubs2
 from srt2ass import srt2ass
 
 class Transcribe:
-    def __init__(self,model_name="small",device='cuda') -> None:
-        # 智能选择计算类型，避免float16兼容性问题
-        if device == 'cuda' and torch.cuda.is_available():
-            try:
-                # 测试GPU是否支持float16
-                test_tensor = torch.tensor([1.0], dtype=torch.float16, device='cuda')
-                _ = test_tensor * 2
-                compute_type = "float16"
-                print("使用float16计算类型")
-            except Exception as e:
-                print(f"GPU不支持float16，使用float32: {e}")
+    def __init__(self,model_name="small",device='cuda',compute_type="auto") -> None:
+        # 如果compute_type为auto，则智能选择计算类型
+        if compute_type == "auto":
+            if device == 'cuda' and torch.cuda.is_available():
+                try:
+                    # 测试GPU是否支持float16
+                    test_tensor = torch.tensor([1.0], dtype=torch.float16, device='cuda')
+                    _ = test_tensor * 2
+                    compute_type = "float16"
+                    print("[INFO] 自动选择float16计算类型")
+                except Exception as e:
+                    print(f"[WARNING] GPU不支持float16，使用float32: {e}")
+                    compute_type = "float32"
+            else:
                 compute_type = "float32"
+                print(f"[INFO] 自动选择float32计算类型")
         else:
-            compute_type = "float32"
+            print(f"[INFO] 使用指定的计算类型: {compute_type}")
             
+        print(f"[INFO] 初始化Whisper模型 - 模型: {model_name}, 设备: {device}, 计算类型: {compute_type}")
         self.model = WhisperModel(model_name,device=device,compute_type=compute_type)
         torch.cuda.empty_cache()
 
@@ -142,6 +147,134 @@ class Transcribe:
         print('生成ass：{}'.format(ass_filename))
         return srt_filename,ass_filename
 
+    def run_with_vad_splitting(self, file_name, audio_binary_io=None, language='ja',
+                              task="transcribe", beam_size=5, is_vad_filter=False,
+                              min_silence_duration_ms=500, is_split=False,
+                              split_method="Modest", sub_style="default",
+                              initial_prompt=None, max_workers=2,
+                              max_segment_duration=30, min_segment_duration=5):
+        """
+        使用VAD分割和并发处理的音频转录方法
+        参数:
+        max_workers (int): 并发线程数
+        max_segment_duration (int): 最大片段时长（秒）
+        min_segment_duration (int): 最小片段时长（秒）
+        其他参数与run方法相同
+        """
+        from utils import split_audio_by_vad, process_audio_segment_concurrent, merge_segment_results
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+        
+        audio_name = os.path.splitext(os.path.basename(file_name))[0]
+        
+        # 如果没有传入音频的二进制，则认为是本地文件
+        if audio_binary_io == None:
+            if not os.path.exists(file_name):
+                raise Exception("File not found")
+            audio = file_name
+        else:
+            audio = audio_binary_io
+        
+        tic = time.time()
+        
+        print("transcribe param (VAD splitting mode)")
+        print(f"audio: {audio}")
+        print(f"language: {language}")
+        print(f"is_vad_filter: {is_vad_filter}")
+        print(f"beam_size: {beam_size}")
+        print(f"initial_prompt: {initial_prompt}")
+        print(f"max_workers: {max_workers}")
+        print(f"max_segment_duration: {max_segment_duration}s")
+        print(f"min_segment_duration: {min_segment_duration}s")
+        
+        # 如果不启用VAD过滤，使用原始方法
+        if not is_vad_filter:
+            print("[INFO] VAD过滤未启用，使用标准处理方法")
+            return self.run(file_name, audio_binary_io, language, task, beam_size,
+                          is_vad_filter, min_silence_duration_ms, is_split,
+                          split_method, sub_style, initial_prompt)
+        
+        try:
+            # 第一步：分割音频
+            print("[INFO] 开始分割音频...")
+            segment_files = split_audio_by_vad(
+                audio_path=audio,
+                max_segment_duration=max_segment_duration,
+                min_segment_duration=min_segment_duration,
+                output_dir="./temp"
+            )
+            
+            # 如果只有一个片段（即未分割），使用原始方法
+            if len(segment_files) == 1 and segment_files[0] == audio:
+                print("[INFO] 音频无需分割，使用标准处理方法")
+                return self.run(file_name, audio_binary_io, language, task, beam_size,
+                              is_vad_filter, min_silence_duration_ms, is_split,
+                              split_method, sub_style, initial_prompt)
+            
+            # 第二步：并发处理各个片段
+            print(f"[INFO] 开始并发处理 {len(segment_files)} 个音频片段...")
+            
+            # 设置VAD参数
+            if is_vad_filter:
+                vad_parameters = dict(min_silence_duration_ms=min_silence_duration_ms)
+            else:
+                vad_parameters = None
+            
+            # 使用线程池并发处理
+            segment_results = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有任务
+                future_to_segment = {
+                    executor.submit(
+                        process_audio_segment_concurrent,
+                        self, segment_path, i, language, task,
+                        beam_size, initial_prompt, vad_parameters
+                    ): i for i, segment_path in enumerate(segment_files)
+                }
+                
+                # 收集结果
+                for future in as_completed(future_to_segment):
+                    segment_index = future_to_segment[future]
+                    try:
+                        result = future.result()
+                        segment_results.append(result)
+                    except Exception as exc:
+                        print(f"[ERROR] 片段 {segment_index + 1} 处理异常: {exc}")
+                        segment_results.append((segment_index, [], None))
+            
+            # 第三步：合并结果
+            print("[INFO] 开始合并处理结果...")
+            srt_filename, ass_filename = merge_segment_results(
+                segment_results=segment_results,
+                segment_files=segment_files,
+                output_dir="./temp",
+                audio_name=audio_name
+            )
+            
+            # 清理临时片段文件
+            print("[INFO] 清理临时片段文件...")
+            for segment_file in segment_files:
+                if segment_file != audio and os.path.exists(segment_file):
+                    try:
+                        os.remove(segment_file)
+                    except Exception as e:
+                        print(f"[WARNING] 无法删除临时文件 {segment_file}: {e}")
+            
+            toc = time.time()
+            print(f"[INFO] VAD分割并发处理完成，总耗时：{toc-tic:.2f}秒")
+            
+            return srt_filename, ass_filename
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"[ERROR] VAD分割并发处理失败: {error_msg}")
+            
+            # 如果分割处理失败，回退到原始方法
+            print("[INFO] 回退到标准处理方法")
+            return self.run(file_name, audio_binary_io, language, task, beam_size,
+                          is_vad_filter, min_silence_duration_ms, is_split,
+                          split_method, sub_style, initial_prompt)
+
 
 if __name__ == "__main__":
     # 使用标准模型名称而不是本地路径
@@ -158,4 +291,8 @@ if __name__ == "__main__":
                  #is_vad_filter=True,
                  #is_split=False
         )
+
+
+
+
 
