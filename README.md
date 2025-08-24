@@ -1,5 +1,6 @@
-# whisper-srt
-使用whisper 模型进行语音识别，生成字幕srt文件，项目根据[auto-subtitle](https://github.com/lissettecarlr/auto-subtitle)修改
+# 🎬 AI字幕生成器
+
+基于Whisper的智能字幕生成工具，支持多种语言识别和翻译，提供友好的Web界面
 
 ## 🚀 主要功能
 
@@ -19,15 +20,17 @@
 
 * conda
     ```bash
-    conda create -n srt python=3.12
-    conda activate srt
+    conda create -n subtitle python=3.10
+    conda activate subtitle
     ```
 
-* torch
+* torch（CUDA 11.8，其他版本去[官网](https://pytorch.org/get-started/locally/)找）
     ```bash
     # GPU
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
+    # CPU
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
     ```
 
 * 安装ffmpeg（windows）。
@@ -69,12 +72,7 @@
 * **模型来源**：
   - [HuggingFace faster-whisper](https://huggingface.co/collections/guillaumekln/faster-whisper-64f9c349b3115b4f51434976)
   - [百度云备份](https://pan.baidu.com/s/1NbutR2cHvHbboUy-QTg5zw?pwd=kuon)
-* **自定义模型转换**：
-```
-pip install faster-whisper
-pip install transformers[torch]>=4.23
-ct2-transformers-converter --model 本地模型目录或者huggingface --output_dir 输出目录 --copy_files tokenizer.json preprocessor_config.json --quantization float16
-```
+
 ### 音频清洁模型（UVR）
 
 * **必需文件**：`UVR_MDXNET_Main.onnx`
