@@ -54,6 +54,42 @@ def load_model(model_path, device_name, compute_type="auto"):
         if app_state.transcribe is not None:
             del app_state.transcribe
         
+        # 优化设备和计算类型选择
+        if device_name == "auto":
+            if torch.cuda.is_available():
+                device_name = "cuda"
+                print(f"[INFO] 检测到CUDA可用，自动选择GPU设备")
+                print(f"[INFO] GPU信息: {torch.cuda.get_device_name(0)}")
+                print(f"[INFO] GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+            else:
+                device_name = "cpu"
+                print(f"[INFO] CUDA不可用，使用CPU设备")
+        
+        # 优化计算类型选择
+        if compute_type == "auto":
+            if device_name == "cuda":
+                # 检查GPU是否支持float16
+                try:
+                    if torch.cuda.is_available():
+                        # 检查GPU计算能力
+                        capability = torch.cuda.get_device_capability(0)
+                        if capability[0] >= 7:  # Volta架构及以上支持更好的float16
+                            compute_type = "float16"
+                            print(f"[INFO] GPU支持float16，使用float16计算类型")
+                        else:
+                            compute_type = "float32"
+                            print(f"[INFO] GPU计算能力较低，使用float32计算类型")
+                    else:
+                        compute_type = "float32"
+                except Exception as e:
+                    print(f"[WARNING] 无法检测GPU能力: {e}，使用float32")
+                    compute_type = "float32"
+            else:
+                compute_type = "float32"
+                print(f"[INFO] CPU设备使用float32计算类型")
+        
+        print(f"[INFO] 最终设备配置: {device_name}, 计算类型: {compute_type}")
+        
         # 检查模型路径
         if model_path and model_path.strip():
             model_path = model_path.strip()
@@ -100,8 +136,8 @@ def load_model(model_path, device_name, compute_type="auto"):
             else:
                 print(f"加载HuggingFace模型：{model_path}")
         
-        # 创建Transcribe实例
-        app_state.transcribe = Transcribe(model_name=model_path, device=device_name)
+        # 创建Transcribe实例，传递计算类型参数
+        app_state.transcribe = Transcribe(model_name=model_path, device=device_name, compute_type=compute_type)
         
         # 保存配置
         app_state.model_name = model_path
@@ -185,6 +221,84 @@ def upload_media(media_file, media_type):
     except Exception as e:
         return f"媒体上传失败：{str(e)}", None, None
 
+def load_media_from_path(media_path, media_type):
+    """从路径加载媒体文件"""
+    try:
+        if not media_path or not media_path.strip():
+            return "请输入媒体文件路径", None, None
+        
+        media_path = media_path.strip()
+        
+        # 检查文件是否存在
+        if not os.path.exists(media_path):
+            return f"❌ 文件不存在：{media_path}", None, None
+        
+        # 检查是否为文件
+        if not os.path.isfile(media_path):
+            return f"❌ 路径不是文件：{media_path}", None, None
+        
+        # 获取文件扩展名
+        file_ext = os.path.splitext(media_path)[1].lower()
+        
+        # 检查文件格式
+        video_formats = [".mp4", ".avi", ".mov", ".mkv"]
+        audio_formats = [".mp3", ".wav", ".m4a"]
+        
+        if media_type == "视频" and file_ext not in video_formats:
+            return f"不支持的视频格式：{file_ext}。支持的格式：{', '.join(video_formats)}", None, None
+        elif media_type == "音频" and file_ext not in audio_formats:
+            return f"不支持的音频格式：{file_ext}。支持的格式：{', '.join(audio_formats)}", None, None
+        
+        if media_type == "视频":
+            # 保存视频文件
+            temp_input_video = os.path.join(
+                TEMP,
+                os.path.splitext(os.path.basename(media_path))[0] + "_temp.mp4"
+            )
+            
+            if not os.path.exists(temp_input_video):
+                # 复制文件
+                import shutil
+                shutil.copy2(media_path, temp_input_video)
+            
+            app_state.video_temp_name = os.path.basename(media_path)
+            app_state.video_temp = temp_input_video
+            
+            # 提取音频
+            temp_audio_path = os.path.join(
+                TEMP,
+                os.path.splitext(os.path.basename(media_path))[0] + ".wav"
+            )
+            
+            if not os.path.exists(temp_audio_path):
+                extract_audio(temp_input_video, temp_audio_path)
+            
+            app_state.audio_temp = temp_audio_path
+            return f"✅ 视频加载成功：{os.path.basename(media_path)}\n🎵 音频提取完成", temp_audio_path, None
+            
+        else:  # 音频
+            temp_audio_path = os.path.join(
+                TEMP,
+                os.path.splitext(os.path.basename(media_path))[0] + ".wav"
+            )
+            
+            if not os.path.exists(temp_audio_path):
+                import shutil
+                shutil.copy2(media_path, temp_audio_path)
+            
+            app_state.audio_temp = temp_audio_path
+            return f"✅ 音频加载成功：{os.path.basename(media_path)}", temp_audio_path, None
+            
+    except Exception as e:
+        return f"加载失败：{str(e)}", None, None
+
+def toggle_upload_method(upload_method):
+    """切换上传方式"""
+    if upload_method == "文件上传":
+        return gr.update(visible=True), gr.update(visible=False)
+    else:
+        return gr.update(visible=False), gr.update(visible=True)
+
 def clean_audio():
     """音频清洁（去除背景音）"""
     if app_state.audio_temp is None:
@@ -224,8 +338,19 @@ def clean_audio():
             return "音频文件过小，可能损坏，请重新上传", None
         
         try:
-            primary_stem_output_path, secondary_stem_output_path = app_state.uvr_client.infer(app_state.audio_temp)
-            app_state.audio_separator_temp = os.path.join('./temp', secondary_stem_output_path)
+            # UVR客户端的infer方法只返回一个文件路径
+            output_file = app_state.uvr_client.infer(app_state.audio_temp)
+            
+            # 如果返回的是原始音频文件，说明处理失败
+            if output_file == app_state.audio_temp:
+                print("[WARNING] UVR处理失败，返回原始音频")
+                return f"音频清洁失败，使用原始音频\n\n原始音频: {app_state.audio_temp}\n您可以直接进行字幕生成", app_state.audio_temp
+            
+            # 设置处理后的音频文件路径
+            if os.path.isabs(output_file):
+                app_state.audio_separator_temp = output_file
+            else:
+                app_state.audio_separator_temp = os.path.join('./temp', os.path.basename(output_file))
             
             # 检查输出文件是否生成成功
             if not os.path.exists(app_state.audio_separator_temp):
@@ -335,9 +460,7 @@ def simple_transcribe_audio(audio_file, language, mode="transcribe", enable_tran
                 
                 if is_standard_model:
                     # 标准模型：Whisper已翻译为英文
-                    text_content = f"🔄 Whisper翻译结果（英文）：\n{text_content}"
-                    
-                    # 根据用户设置决定是否使用外部翻译引擎
+                    # 如果启用外部翻译引擎，优先使用外部翻译结果
                     if enable_translation == "启用" and app_state.engine is not None:
                         try:
                             from translation import translation
@@ -353,18 +476,15 @@ def simple_transcribe_audio(audio_file, language, mode="transcribe", enable_tran
                                         line = line.strip()
                                         if line and not line.isdigit() and '-->' not in line:
                                             translated_content += line + "\n"
-                                text_content += f"\n\n🔄 外部翻译引擎结果：\n{translated_content}"
+                                text_content = translated_content.strip()
                         except Exception as e:
-                            text_content += f"\n\n⚠️ 外部翻译失败：{str(e)}"
-                    elif enable_translation == "禁用":
-                        text_content += "\n\n💡 提示：外部翻译引擎已禁用，如需翻译为其他语言请启用外部翻译"
-                    else:
-                        text_content += "\n\n💡 提示：如需翻译为中文等其他语言，请先设置外部翻译引擎"
+                            # 外部翻译失败时使用Whisper英文结果
+                            pass
+                    # 如果没有启用外部翻译或外部翻译失败，使用Whisper英文结果
+                    # text_content 保持原始Whisper的英文翻译结果
                 else:
                     # 微调模型：可能已直接翻译为目标语言
-                    text_content = f"🔄 微调模型翻译结果：\n{text_content}"
-                    
-                    # 微调模型也可以选择使用外部翻译引擎优化质量
+                    # 如果启用外部翻译引擎，优先使用外部翻译结果
                     if enable_translation == "启用" and app_state.engine is not None:
                         try:
                             from translation import translation
@@ -380,13 +500,12 @@ def simple_transcribe_audio(audio_file, language, mode="transcribe", enable_tran
                                         line = line.strip()
                                         if line and not line.isdigit() and '-->' not in line:
                                             translated_content += line + "\n"
-                                text_content += f"\n\n🔄 外部翻译引擎优化结果：\n{translated_content}"
+                                text_content = translated_content.strip()
                         except Exception as e:
-                            text_content += f"\n\n⚠️ 外部翻译失败：{str(e)}"
-                    elif enable_translation == "启用":
-                        text_content += "\n\n💡 提示：如需外部翻译引擎优化，请先设置翻译引擎"
-                    else:
-                        text_content += "\n\n💡 提示：微调模型已尝试直接翻译，如需更好质量可启用外部翻译引擎"
+                            # 外部翻译失败时使用微调模型结果
+                            pass
+                    # 如果没有启用外部翻译或外部翻译失败，使用微调模型结果
+                    # text_content 保持原始微调模型的翻译结果
             
             # 保存文本文件
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -468,17 +587,37 @@ def process_subtitle(language, subtitle_mode, vad_filter, min_silence_duration, 
                     whisper_target_lang = target_lang_map.get(target_language, "en")
                     print(f"[INFO] 使用微调模型，尝试直接翻译到{target_language} ({whisper_target_lang})")
             
-            srt, ass = app_state.transcribe.run(
-                file_name=input_audio,
-                audio_binary_io=input_audio,
-                language=lang_code,
-                task=task,
-                is_vad_filter=is_vad_filter,
-                min_silence_duration_ms=min_silence_ms,
-                is_split=is_split,
-                split_method=split_method,
-                initial_prompt=initial_prompt
-            )
+            # 根据VAD设置选择处理方法
+            if is_vad_filter:
+                # 使用VAD分割和并发处理
+                print(f"[INFO] 启用VAD分割并发处理模式")
+                srt, ass = app_state.transcribe.run_with_vad_splitting(
+                    file_name=input_audio,
+                    audio_binary_io=input_audio,
+                    language=lang_code,
+                    task=task,
+                    is_vad_filter=is_vad_filter,
+                    min_silence_duration_ms=min_silence_ms,
+                    is_split=is_split,
+                    split_method=split_method,
+                    initial_prompt=initial_prompt,
+                    max_workers=2,  # 并发线程数，可以根据需要调整
+                    max_segment_duration=30,  # 最大片段时长30秒
+                    min_segment_duration=5   # 最小片段时长5秒
+                )
+            else:
+                # 使用标准处理方法
+                srt, ass = app_state.transcribe.run(
+                    file_name=input_audio,
+                    audio_binary_io=input_audio,
+                    language=lang_code,
+                    task=task,
+                    is_vad_filter=is_vad_filter,
+                    min_silence_duration_ms=min_silence_ms,
+                    is_split=is_split,
+                    split_method=split_method,
+                    initial_prompt=initial_prompt
+                )
             print(f"[INFO] 字幕生成成功 - 任务类型: {task}")
             
             # 判断是否需要外部翻译
@@ -674,7 +813,7 @@ def create_interface():
                         with gr.Row():
                             audio_language = gr.Dropdown(
                                 choices=["中文", "日文", "英文", "自动检测"],
-                                value="自动检测",
+                                value="中文",
                                 label="音频语言"
                             )
                             
@@ -761,10 +900,28 @@ def create_interface():
                         label="媒体类型（支持视频格式：mp4, avi, mov, mkv；音频格式：mp3, wav, m4a）"
                     )
                 
-                media_file = gr.File(
-                    label="上传媒体文件",
-                    file_types=[".mp4", ".avi", ".mov", ".mkv", ".mp3", ".wav", ".m4a"]
+                # 上传方式选择
+                upload_method = gr.Radio(
+                    choices=["文件上传", "路径输入"],
+                    value="文件上传",
+                    label="上传方式"
                 )
+                
+                # 文件上传组件
+                with gr.Group(visible=True) as file_upload_group:
+                    media_file = gr.File(
+                        label="上传媒体文件",
+                        file_types=[".mp4", ".avi", ".mov", ".mkv", ".mp3", ".wav", ".m4a"]
+                    )
+                
+                # 路径输入组件
+                with gr.Group(visible=False) as path_input_group:
+                    media_path = gr.Textbox(
+                        label="媒体文件路径",
+                        placeholder="请输入媒体文件的完整路径，例如：D:\\videos\\example.mp4",
+                        info="支持本地文件路径，确保文件存在且格式正确"
+                    )
+                    load_from_path_btn = gr.Button("📁 从路径加载", variant="secondary")
                 
                 upload_status = gr.Textbox(label="上传状态", interactive=False)
                 
@@ -1002,10 +1159,24 @@ def create_interface():
         
         # 字幕生成页面事件绑定
         
+        # 上传方式切换
+        upload_method.change(
+            fn=toggle_upload_method,
+            inputs=[upload_method],
+            outputs=[file_upload_group, path_input_group]
+        )
+        
         # 媒体上传
         media_file.change(
             fn=upload_media,
             inputs=[media_file, media_type],
+            outputs=[upload_status, original_audio, cleaned_audio]
+        )
+        
+        # 从路径加载媒体文件
+        load_from_path_btn.click(
+            fn=load_media_from_path,
+            inputs=[media_path, media_type],
             outputs=[upload_status, original_audio, cleaned_audio]
         )
         
